@@ -106,7 +106,7 @@ public abstract class AbstractAWSCredentialsProviderProcessor<ClientType extends
      * @see  <a href="http://docs.aws.amazon.com/AWSJavaSDK/latest/javadoc/com/amazonaws/auth/AWSCredentialsProvider.html">AWSCredentialsProvider</a>
      */
     protected AWSCredentialsProvider getCredentialsProvider(final ProcessContext context) {
-        AWSCredentialsProvider credentialsProvider = DefaultAWSCredentialsProviderChain.getInstance();
+        AWSCredentialsProvider credentialsProvider = new DefaultAWSCredentialsProviderChain();
 
         if (context.getProperty(AWS_CREDENTIALS_PROVIDER_SERVICE).isSet()) {
             getLogger().debug("Using aws credentials provider service for creating client");
