@@ -136,7 +136,8 @@ public class SchemaRepositoryRecordSerde extends RepositoryRecordSerde implement
             case UPDATE:
                 return updateRecord(record);
             default:
-                throw new IOException("Found unrecognized Update Type '" + actionType + "'");
+		return deleteRecord(record);
+//                throw new IOException("Found unrecognized Update Type '" + actionType + "'");
         }
     }
 
