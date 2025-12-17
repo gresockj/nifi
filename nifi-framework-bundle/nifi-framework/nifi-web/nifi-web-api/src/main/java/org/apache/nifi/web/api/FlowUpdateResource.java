@@ -16,6 +16,10 @@
  */
 package org.apache.nifi.web.api;
 
+import jakarta.ws.rs.HttpMethod;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.Response.Status;
 import org.apache.nifi.authorization.AuthorizableLookup;
 import org.apache.nifi.authorization.AuthorizeControllerServiceReference;
 import org.apache.nifi.authorization.AuthorizeParameterProviders;
@@ -30,6 +34,7 @@ import org.apache.nifi.cluster.manager.NodeResponse;
 import org.apache.nifi.components.ConfigurableComponent;
 import org.apache.nifi.controller.ScheduledState;
 import org.apache.nifi.controller.service.ControllerServiceState;
+import org.apache.nifi.flow.ExternalControllerServiceReference;
 import org.apache.nifi.flow.VersionedParameterContext;
 import org.apache.nifi.flow.VersionedProcessGroup;
 import org.apache.nifi.registry.flow.FlowRegistryUtils;
@@ -64,11 +69,6 @@ import org.apache.nifi.web.util.InvalidComponentAction;
 import org.apache.nifi.web.util.LifecycleManagementException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import jakarta.ws.rs.HttpMethod;
-import jakarta.ws.rs.core.MediaType;
-import jakarta.ws.rs.core.Response;
-import jakarta.ws.rs.core.Response.Status;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 
@@ -458,6 +458,21 @@ public abstract class FlowUpdateResource<T extends ProcessGroupDescriptorEntity,
                     }
 
                     throw e;
+                }
+
+                // After synchronization is complete but before re-enabling services/processors,
+                // attempt an additional pass to resolve inherited/external Controller Services on the live PG.
+                // This operates on the instantiated graph and can repair references using ancestor services.
+                try {
+                    final Map<String, ExternalControllerServiceReference> externalServiceReferences = flowSnapshot.getExternalControllerServices();
+                    final Set<String> postSyncUnresolved = serviceFacade.resolveInheritedControllerServicesPostMigration(externalServiceReferences, groupId, NiFiUserUtils.getNiFiUser());
+                    if (!postSyncUnresolved.isEmpty()) {
+                        logger.info("Post-sync Controller Service post-migration resolution completed with {} unresolved references", postSyncUnresolved.size());
+                    } else {
+                        logger.info("Post-sync Controller Service post-migration resolution completed with no unresolved references");
+                    }
+                } catch (final Exception e) {
+                    logger.warn("Post-sync Controller Service post-migration resolution encountered an error; proceeding to re-enable/start components", e);
                 }
             }
         } finally {

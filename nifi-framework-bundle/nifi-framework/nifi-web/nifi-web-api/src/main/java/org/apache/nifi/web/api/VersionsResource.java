@@ -82,6 +82,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -1150,8 +1151,9 @@ public class VersionsResource extends FlowUpdateResource<VersionControlInformati
         // the flow snapshot to contain compatible bundles.
         serviceFacade.discoverCompatibleBundles(flowSnapshot.getFlowContents());
 
-        // If there are any Controller Services referenced that are inherited from the parent group, resolve those to point to the appropriate Controller Service, if we are able to.
-        final Set<String> unresolvedControllerServices = serviceFacade.resolveInheritedControllerServices(flowSnapshotContainer, groupId, NiFiUserUtils.getNiFiUser());
+        // Note: Controller Service resolution is now deferred until after property migration
+        // This will happen in StandardVersionedComponentSynchronizer after components are migrated
+        final Set<String> unresolvedControllerServices = new HashSet<>();
 
         // If there are any Parameter Providers referenced by Parameter Contexts, resolve these to point to the appropriate Parameter Provider, if we are able to.
         final Set<String> unresolvedParameterProviders = serviceFacade.resolveParameterProviders(flowSnapshot, NiFiUserUtils.getNiFiUser());

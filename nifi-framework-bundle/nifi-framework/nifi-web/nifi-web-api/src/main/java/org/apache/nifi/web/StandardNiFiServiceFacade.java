@@ -327,8 +327,8 @@ import org.apache.nifi.web.api.entity.ActivateControllerServicesEntity;
 import org.apache.nifi.web.api.entity.AffectedComponentEntity;
 import org.apache.nifi.web.api.entity.AssetEntity;
 import org.apache.nifi.web.api.entity.BulletinEntity;
-import org.apache.nifi.web.api.entity.ClearBulletinsResultEntity;
 import org.apache.nifi.web.api.entity.ClearBulletinsForGroupResultsEntity;
+import org.apache.nifi.web.api.entity.ClearBulletinsResultEntity;
 import org.apache.nifi.web.api.entity.ComponentReferenceEntity;
 import org.apache.nifi.web.api.entity.ComponentValidationResultEntity;
 import org.apache.nifi.web.api.entity.ConfigurationAnalysisEntity;
@@ -4252,6 +4252,19 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
     @Override
     public Set<String> resolveInheritedControllerServices(final FlowSnapshotContainer flowSnapshotContainer, final String processGroupId, final NiFiUser user) {
         return controllerFacade.getControllerServiceResolver().resolveInheritedControllerServices(flowSnapshotContainer, processGroupId, user);
+    }
+
+    @Override
+    public Set<String> resolveInheritedControllerServicesPostMigration(final Map<String, ExternalControllerServiceReference> externalControllerServiceReferences,
+                                                                       final String processGroupId,
+                                                                       final NiFiUser user) {
+        final ProcessGroup processGroup = processGroupDAO.getProcessGroup(processGroupId);
+        if (processGroup == null) {
+            return Collections.emptySet();
+        }
+
+        return controllerFacade.getControllerServiceResolver()
+                .resolveInheritedControllerServicesPostMigration(processGroup, externalControllerServiceReferences, user);
     }
 
     @Override

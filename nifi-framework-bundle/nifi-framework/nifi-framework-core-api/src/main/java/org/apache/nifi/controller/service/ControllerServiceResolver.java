@@ -17,8 +17,11 @@
 package org.apache.nifi.controller.service;
 
 import org.apache.nifi.authorization.user.NiFiUser;
+import org.apache.nifi.flow.ExternalControllerServiceReference;
+import org.apache.nifi.groups.ProcessGroup;
 import org.apache.nifi.registry.flow.FlowSnapshotContainer;
 
+import java.util.Map;
 import java.util.Set;
 
 public interface ControllerServiceResolver {
@@ -39,5 +42,17 @@ public interface ControllerServiceResolver {
      * @return Any unresolved Controller Services
      */
     Set<String> resolveInheritedControllerServices(FlowSnapshotContainer flowSnapshotContainer, String parentGroupId, NiFiUser user);
+
+    /**
+     * Resolves inherited controller services after property migration has occurred. This method maps the live
+     * components back to a versioned snapshot, runs the standard resolution logic on that snapshot, and then
+     * applies the resolved controller service references back to the live components.
+     *
+     * @param group the process group containing the components to resolve
+     * @param externalControllerServiceReferences the external controller service references from the original flow snapshot
+     * @param user the user performing the operation
+     * @return the set of unresolved controller service identifiers
+     */
+    Set<String> resolveInheritedControllerServicesPostMigration(ProcessGroup group, Map<String, ExternalControllerServiceReference> externalControllerServiceReferences, NiFiUser user);
 
 }

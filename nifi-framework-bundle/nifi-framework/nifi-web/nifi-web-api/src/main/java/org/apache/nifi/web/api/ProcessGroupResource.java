@@ -60,6 +60,7 @@ import org.apache.nifi.cluster.manager.NodeResponse;
 import org.apache.nifi.components.ConfigurableComponent;
 import org.apache.nifi.connectable.ConnectableType;
 import org.apache.nifi.flow.ConnectableComponent;
+import org.apache.nifi.flow.ExternalControllerServiceReference;
 import org.apache.nifi.flow.ExecutionEngine;
 import org.apache.nifi.flow.VersionedComponent;
 import org.apache.nifi.flow.VersionedFlowCoordinates;
@@ -1073,8 +1074,8 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
             // Step 5: Resolve Bundle info
             serviceFacade.discoverCompatibleBundles(flowSnapshot.getFlowContents());
 
-            // If there are any Controller Services referenced that are inherited from the parent group, resolve those to point to the appropriate Controller Service, if we are able to.
-            unresolvedControllerServices.addAll(serviceFacade.resolveInheritedControllerServices(flowSnapshotContainer, groupId, NiFiUserUtils.getNiFiUser()));
+            // Note: Controller Service resolution is now deferred until after property migration
+            // This will happen in StandardVersionedComponentSynchronizer after components are migrated
 
             // If there are any Parameter Providers referenced by Parameter Contexts, resolve these to point to the appropriate Parameter Provider, if we are able to.
             unresolvedParameterProviders.addAll(serviceFacade.resolveParameterProviders(flowSnapshot, NiFiUserUtils.getNiFiUser()));
@@ -1141,6 +1142,18 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
                         flowSnapshot.getFlowContents().setPosition(null);
                         entity = serviceFacade.updateProcessGroupContents(newGroupRevision, newGroupId, versionControlInfo, flowSnapshot,
                                 getIdGenerationSeed().orElse(null), false, true, true);
+
+                        // After synchronization is complete, attempt an additional pass to resolve inherited/external Controller Services.
+                        // This operates on the instantiated graph and can repair references using ancestor services.
+                        try {
+                            final Map<String, ExternalControllerServiceReference> externalServiceReferences = flowSnapshot.getExternalControllerServices();
+                            final Set<String> postSyncUnresolved = serviceFacade.resolveInheritedControllerServicesPostMigration(externalServiceReferences, newGroupId, NiFiUserUtils.getNiFiUser());
+                            if (!postSyncUnresolved.isEmpty()) {
+                                logger.info("Post-sync Controller Service post-migration resolution completed with {} unresolved references", postSyncUnresolved.size());
+                            }
+                        } catch (final Exception e) {
+                            logger.warn("Post-sync Controller Service post-migration resolution encountered an error; proceeding with process group creation", e);
+                        }
                     }
 
                     populateRemainingProcessGroupEntityContent(entity);
@@ -2910,6 +2923,14 @@ public class ProcessGroupResource extends FlowUpdateResource<ProcessGroupImportE
 
                         entity = serviceFacade.updateProcessGroupContents(newGroupRevision, newGroupId, null, flowSnapshot,
                                 getIdGenerationSeed().orElse(null), false, false, true);
+
+                        // After synchronization is complete, attempt post-migration Controller Service resolution
+                        try {
+                            final Map<String, ExternalControllerServiceReference> externalServiceReferences = flowSnapshot.getExternalControllerServices();
+                            serviceFacade.resolveInheritedControllerServicesPostMigration(externalServiceReferences, newGroupId, NiFiUserUtils.getNiFiUser());
+                        } catch (final Exception e) {
+                            logger.warn("Post-upload Controller Service post-migration resolution encountered an error for Process Group {}", newGroupId, e);
+                        }
                     }
 
                     populateRemainingProcessGroupEntityContent(entity);

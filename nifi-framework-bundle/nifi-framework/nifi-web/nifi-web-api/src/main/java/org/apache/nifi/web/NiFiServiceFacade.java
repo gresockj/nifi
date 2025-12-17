@@ -102,8 +102,8 @@ import org.apache.nifi.web.api.entity.ActivateControllerServicesEntity;
 import org.apache.nifi.web.api.entity.AffectedComponentEntity;
 import org.apache.nifi.web.api.entity.AssetEntity;
 import org.apache.nifi.web.api.entity.BulletinEntity;
-import org.apache.nifi.web.api.entity.ClearBulletinsResultEntity;
 import org.apache.nifi.web.api.entity.ClearBulletinsForGroupResultsEntity;
+import org.apache.nifi.web.api.entity.ClearBulletinsResultEntity;
 import org.apache.nifi.web.api.entity.ComponentValidationResultEntity;
 import org.apache.nifi.web.api.entity.ConfigurationAnalysisEntity;
 import org.apache.nifi.web.api.entity.ConnectionEntity;
@@ -2848,6 +2848,27 @@ public interface NiFiServiceFacade {
      * @return Any unresolved controller services
      */
     Set<String> resolveInheritedControllerServices(FlowSnapshotContainer flowSnapshotContainer, String parentGroupId, NiFiUser user);
+
+    /**
+     * Resolves inherited controller services post-migration by mapping live components to a snapshot,
+     * running the snapshot-based resolution logic, and applying the results back to live components.
+     * This method operates on the instantiated graph after property migration has occurred and attempts to
+     * update component properties that reference Controller Services when the referenced identifier does not exist on
+     * the target system. A property will be updated only when there is an unambiguous match to a Controller Service in
+     * the same or ancestor Process Group that:
+     * <ul>
+     *     <li>Implements the API required by the property descriptor</li>
+     *     <li>Has an exact name match to the external Controller Service name referenced by the provided snapshot</li>
+     * </ul>
+     * When multiple services match, the property is left unchanged and the original unresolved identifier is returned
+     * in the result set.
+     *
+     * @param externalControllerServiceReferences the external controller service references from the flow snapshot
+     * @param processGroupId the id of the process group
+     * @param user the user
+     * @return the set of unresolved controller service identifiers
+     */
+    Set<String> resolveInheritedControllerServicesPostMigration(Map<String, ExternalControllerServiceReference> externalControllerServiceReferences, String processGroupId, NiFiUser user);
 
     /**
      * For any Parameter Provider that is found in the given Versioned Process Group, attempts to find an existing Parameter Provider that matches the definition. If any is found,
