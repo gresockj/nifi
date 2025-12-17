@@ -98,6 +98,7 @@ import org.apache.nifi.controller.ScheduledState;
 import org.apache.nifi.controller.Snippet;
 import org.apache.nifi.controller.VerifiableControllerService;
 import org.apache.nifi.controller.flow.FlowManager;
+import org.apache.nifi.controller.service.LiveControllerServiceResolutionPlan;
 import org.apache.nifi.controller.label.Label;
 import org.apache.nifi.controller.leader.election.LeaderElectionManager;
 import org.apache.nifi.controller.repository.FlowFileEvent;
@@ -327,8 +328,8 @@ import org.apache.nifi.web.api.entity.ActivateControllerServicesEntity;
 import org.apache.nifi.web.api.entity.AffectedComponentEntity;
 import org.apache.nifi.web.api.entity.AssetEntity;
 import org.apache.nifi.web.api.entity.BulletinEntity;
-import org.apache.nifi.web.api.entity.ClearBulletinsResultEntity;
 import org.apache.nifi.web.api.entity.ClearBulletinsForGroupResultsEntity;
+import org.apache.nifi.web.api.entity.ClearBulletinsResultEntity;
 import org.apache.nifi.web.api.entity.ComponentReferenceEntity;
 import org.apache.nifi.web.api.entity.ComponentValidationResultEntity;
 import org.apache.nifi.web.api.entity.ConfigurationAnalysisEntity;
@@ -4252,6 +4253,118 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
     @Override
     public Set<String> resolveInheritedControllerServices(final FlowSnapshotContainer flowSnapshotContainer, final String processGroupId, final NiFiUser user) {
         return controllerFacade.getControllerServiceResolver().resolveInheritedControllerServices(flowSnapshotContainer, processGroupId, user);
+    }
+
+    @Override
+    public Set<String> resolveInheritedControllerServicesLive(final FlowSnapshotContainer flowSnapshotContainer, final String processGroupId, final NiFiUser user) {
+        final ProcessGroup root = processGroupDAO.getProcessGroup(processGroupId);
+        if (root == null) {
+            return Collections.emptySet();
+        }
+
+        final LiveControllerServiceResolutionPlan plan = controllerFacade.getControllerServiceResolver()
+                .planLiveControllerServiceResolutions(flowSnapshotContainer, processGroupId, user);
+
+        int applied = 0;
+
+        // Apply processor updates
+        for (final Map.Entry<String, Map<String, String>> entry : plan.getProcessorUpdates().entrySet()) {
+            final String processorId = entry.getKey();
+            final Map<String, String> updates = entry.getValue();
+            if (updates == null || updates.isEmpty()) {
+                continue;
+            }
+
+            try {
+                final ProcessorEntity processor = getProcessor(processorId);
+                if (processor != null && processor.getComponent() != null) {
+                    applyProcessorPropertyUpdates(processorId, updates);
+                    applied++;
+                } else if (logger.isDebugEnabled()) {
+                    logger.debug("Live CS resolver: processor {} not found while applying plan; skipping", processorId);
+                }
+            } catch (final Exception e) {
+                logger.warn("Failed to apply live Controller Service resolution updates to processor {}: {}", processorId, e.getMessage(), e);
+            }
+        }
+
+        // Apply controller service updates
+        for (final Map.Entry<String, Map<String, String>> entry : plan.getControllerServiceUpdates().entrySet()) {
+            final String controllerServiceId = entry.getKey();
+            final Map<String, String> updates = entry.getValue();
+            if (updates == null || updates.isEmpty()) {
+                continue;
+            }
+
+            try {
+                final ControllerServiceEntity service = getControllerService(controllerServiceId, true);
+                if (service != null && service.getComponent() != null) {
+                    applyControllerServicePropertyUpdates(controllerServiceId, updates);
+                    applied++;
+                } else if (logger.isDebugEnabled()) {
+                    logger.debug("Live CS resolver: controller service {} not found while applying plan; skipping", controllerServiceId);
+                }
+            } catch (final Exception e) {
+                logger.warn("Failed to apply live Controller Service resolution updates to controller service {}: {}", controllerServiceId, e.getMessage(), e);
+            }
+        }
+
+        // For now, log summary based on applied changes; unresolved count can be refined if needed
+        if (applied == 0) {
+            logger.info("Post-sync Controller Service live resolution completed with no updates under Process Group {}", processGroupId);
+        } else {
+            logger.info("Post-sync Controller Service live resolution applied {} updates under Process Group {}", applied, processGroupId);
+        }
+
+        return Collections.emptySet();
+    }
+
+    private void applyProcessorPropertyUpdates(final String processorId, final Map<String, String> updates) {
+        final ProcessorEntity current = getProcessor(processorId);
+        if (current == null || current.getComponent() == null) {
+            return;
+        }
+
+        final RevisionDTO revDto = current.getRevision();
+        final Revision revision = new Revision(revDto.getVersion(), revDto.getClientId(), processorId);
+
+        final ProcessorDTO dto = new ProcessorDTO();
+        dto.setId(processorId);
+        final ProcessorConfigDTO config = new ProcessorConfigDTO();
+        // Merge updates into the current properties to avoid clearing unrelated properties
+        final Map<String, String> merged = new HashMap<>();
+        final ProcessorConfigDTO currentConfig = current.getComponent().getConfig();
+        if (currentConfig != null && currentConfig.getProperties() != null) {
+            merged.putAll(currentConfig.getProperties());
+        }
+        merged.putAll(updates);
+        config.setProperties(merged);
+        dto.setConfig(config);
+
+        updateProcessor(revision, dto);
+    }
+
+    private void applyControllerServicePropertyUpdates(final String controllerServiceId, final Map<String, String> updates) {
+        final ControllerServiceEntity current = getControllerService(controllerServiceId, true);
+        if (current == null || current.getComponent() == null) {
+            return;
+        }
+
+        final RevisionDTO revDto = current.getRevision();
+        final Revision revision = new Revision(revDto.getVersion(), revDto.getClientId(), controllerServiceId);
+
+        final ControllerServiceDTO dto = new ControllerServiceDTO();
+        dto.setId(controllerServiceId);
+        // Merge updates into the current properties to avoid clearing unrelated properties
+        final Map<String, String> merged = new HashMap<>();
+        final Map<String, String> currentProps = current.getComponent().getProperties();
+        if (currentProps != null) {
+            merged.putAll(currentProps);
+        }
+        merged.putAll(updates);
+        dto.setProperties(merged);
+
+        updateControllerService(revision, dto);
     }
 
     @Override

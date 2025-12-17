@@ -19,6 +19,10 @@ package org.apache.nifi.controller.service;
 import org.apache.nifi.authorization.Authorizer;
 import org.apache.nifi.authorization.RequestAction;
 import org.apache.nifi.authorization.user.NiFiUser;
+import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.controller.ComponentNode;
+import org.apache.nifi.controller.ControllerService;
+import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.flow.FlowManager;
 import org.apache.nifi.flow.ControllerServiceAPI;
 import org.apache.nifi.flow.ExternalControllerServiceReference;
@@ -32,7 +36,10 @@ import org.apache.nifi.registry.flow.FlowSnapshotContainer;
 import org.apache.nifi.registry.flow.RegisteredFlowSnapshot;
 import org.apache.nifi.registry.flow.mapping.NiFiRegistryFlowMapper;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -80,6 +87,182 @@ public class StandardControllerServiceResolver implements ControllerServiceResol
         final Set<String> unresolvedServices = new HashSet<>();
         resolveInheritedControllerServices(flowSnapshotContainer, versionedGroup, externalControllerServiceReferences, serviceHierarchyStack, unresolvedServices);
         return unresolvedServices;
+    }
+
+    @Override
+    public LiveControllerServiceResolutionPlan planLiveControllerServiceResolutions(final FlowSnapshotContainer flowSnapshotContainer,
+                                                                                    final String parentGroupId,
+                                                                                    final NiFiUser user) {
+        final ProcessGroup root = flowManager.getGroup(parentGroupId);
+        if (root == null) {
+            return new LiveControllerServiceResolutionPlan(Map.of(), Map.of(), Set.of());
+        }
+
+        // Build external id -> name mapping from the snapshot and all versioned descendants
+        final Map<String, String> externalIdToName = new HashMap<>();
+        buildExternalControllerServiceNameMap(flowSnapshotContainer, externalIdToName);
+
+        final Deque<Set<ControllerServiceNode>> ancestorStack = new ArrayDeque<>();
+
+        // Pre-populate with ancestor groups' services (nearest parent first), filtered by READ auth
+        final List<ProcessGroup> ancestors = new ArrayList<>();
+        ProcessGroup parent = root.getParent();
+        while (parent != null) {
+            ancestors.add(parent);
+            parent = parent.getParent();
+        }
+        for (int i = ancestors.size() - 1; i >= 0; i--) {
+            final ProcessGroup ancestor = ancestors.get(i);
+            final Set<ControllerServiceNode> readable = ancestor.getControllerServices(false).stream()
+                    .filter(svc -> svc.isAuthorized(authorizer, RequestAction.READ, user))
+                    .collect(Collectors.toCollection(HashSet::new));
+            ancestorStack.push(readable);
+        }
+
+        final Map<String, Map<String, String>> processorUpdates = new HashMap<>();
+        final Map<String, Map<String, String>> controllerServiceUpdates = new HashMap<>();
+
+        findLiveResolutionsPlanRecursive(root, ancestorStack, externalIdToName, user, processorUpdates, controllerServiceUpdates);
+        // TODO: Pass the computed set of unresolved identifiers
+        return new LiveControllerServiceResolutionPlan(processorUpdates, controllerServiceUpdates, Set.of());
+    }
+
+    private void findLiveResolutionsPlanRecursive(final ProcessGroup group,
+                                                  final Deque<Set<ControllerServiceNode>> ancestorStack,
+                                                  final Map<String, String> externalIdToName,
+                                                  final NiFiUser user,
+                                                  final Map<String, Map<String, String>> processorUpdates,
+                                                  final Map<String, Map<String, String>> controllerServiceUpdates) {
+        // Resolve current group components using only ancestors
+        for (final ProcessorNode processorNode : group.getProcessors()) {
+            final Map<String, String> updates = findServiceReferenceUpdatesLevelAware(processorNode, ancestorStack, externalIdToName);
+            if (!updates.isEmpty()) {
+                processorUpdates.put(processorNode.getIdentifier(), updates);
+            }
+        }
+
+        for (final ControllerServiceNode serviceNode : group.getControllerServices(false)) {
+            final Map<String, String> updates = findServiceReferenceUpdatesLevelAware(serviceNode, ancestorStack, externalIdToName);
+            if (!updates.isEmpty()) {
+                controllerServiceUpdates.put(serviceNode.getIdentifier(), updates);
+            }
+        }
+
+        // Push current group's services (filtered by READ) before recursing into children
+        final Set<ControllerServiceNode> currentServices = group.getControllerServices(false).stream()
+                .filter(svc -> svc.isAuthorized(authorizer, RequestAction.READ, user))
+                .collect(Collectors.toCollection(HashSet::new));
+        ancestorStack.push(currentServices);
+
+        for (final ProcessGroup child : group.getProcessGroups()) {
+            findLiveResolutionsPlanRecursive(child, ancestorStack, externalIdToName, user, processorUpdates, controllerServiceUpdates);
+        }
+
+        ancestorStack.pop();
+    }
+
+    private Map<String, String> findServiceReferenceUpdatesLevelAware(final ComponentNode componentNode,
+                                                                      final Deque<Set<ControllerServiceNode>> ancestorStack,
+                                                                      final Map<String, String> externalIdToName) {
+        final Map<String, String> updates = new HashMap<>();
+
+        componentNode.getPropertyDescriptors().forEach(listedDescriptor -> {
+            final PropertyDescriptor descriptor = componentNode.getPropertyDescriptor(listedDescriptor.getName());
+            if (descriptor == null) {
+                return;
+            }
+
+            final Class<? extends ControllerService> requiredApi = descriptor.getControllerServiceDefinition();
+            if (requiredApi == null) {
+                return;
+            }
+
+            final String rawValue = componentNode.getRawPropertyValue(descriptor);
+            if (rawValue == null || isParameterized(rawValue)) {
+                return;
+            }
+
+            // If already points to an existing service in scope, skip
+            final boolean exists = ancestorStack.stream().flatMap(Set::stream).anyMatch(svc -> svc.getIdentifier().equals(rawValue));
+            if (exists) {
+                return;
+            }
+
+            final String externalName = externalIdToName.get(rawValue);
+            if (externalName == null) {
+                return;
+            }
+
+            ControllerServiceNode chosen = null;
+            for (final Set<ControllerServiceNode> levelServices : ancestorStack) {
+                final List<ControllerServiceNode> levelMatches = levelServices.stream()
+                        .filter(svc -> externalName.equals(svc.getName()))
+                        .filter(svc -> requiredApi.isAssignableFrom(svc.getControllerServiceImplementation().getClass()))
+                        .toList();
+
+                if (levelMatches.size() == 1) {
+                    chosen = levelMatches.getFirst();
+                    break;
+                } else if (levelMatches.size() > 1) {
+                    // Ambiguous at this level; stop evaluation
+                    break;
+                }
+            }
+
+            if (chosen != null) {
+                updates.put(descriptor.getName(), chosen.getIdentifier());
+            }
+        });
+
+        return updates;
+    }
+
+    private boolean isParameterized(final String value) {
+        return value.contains("#{") || value.contains("${");
+    }
+
+    private void buildExternalControllerServiceNameMap(final FlowSnapshotContainer container, final Map<String, String> idToName) {
+        if (container == null) {
+            return;
+        }
+
+        final RegisteredFlowSnapshot top = container.getFlowSnapshot();
+        if (top != null && top.getExternalControllerServices() != null) {
+            top.getExternalControllerServices().forEach((id, ref) -> {
+                if (ref != null && ref.getName() != null) {
+                    idToName.put(id, ref.getName());
+                }
+            });
+        }
+
+        if (top != null && top.getFlowContents() != null && top.getFlowContents().getProcessGroups() != null) {
+            addChildExternalServiceNamesRecursively(container, top.getFlowContents(), idToName);
+        }
+    }
+
+    private void addChildExternalServiceNamesRecursively(final FlowSnapshotContainer container,
+                                                         final VersionedProcessGroup parent,
+                                                         final Map<String, String> idToName) {
+        if (parent.getProcessGroups() == null) {
+            return;
+        }
+
+        for (final VersionedProcessGroup child : parent.getProcessGroups()) {
+            final RegisteredFlowSnapshot childSnap = container.getChildSnapshot(child.getIdentifier());
+            if (childSnap != null && childSnap.getExternalControllerServices() != null) {
+                childSnap.getExternalControllerServices().forEach((id, ref) -> {
+                    if (ref != null && ref.getName() != null) {
+                        idToName.put(id, ref.getName());
+                    }
+                });
+
+                if (childSnap.getFlowContents() != null) {
+                    addChildExternalServiceNamesRecursively(container, childSnap.getFlowContents(), idToName);
+                }
+            } else if (child.getVersionedFlowCoordinates() == null && child.getProcessGroups() != null) {
+                addChildExternalServiceNamesRecursively(container, child, idToName);
+            }
+        }
     }
 
     private void resolveInheritedControllerServices(final FlowSnapshotContainer flowSnapshotContainer, final VersionedProcessGroup versionedGroup,
@@ -178,7 +361,7 @@ public class StandardControllerServiceResolver implements ControllerServiceResol
             final List<VersionedControllerService> matchingControllerServices = availableControllerServices.stream()
                     .filter(service -> service.getName().equals(externalControllerServiceName))
                     .filter(service -> implementsApi(descriptorRequiredApi, service))
-                    .collect(Collectors.toList());
+                    .toList();
 
             if (matchingControllerServices.size() != 1) {
                 unresolvedServices.add(propertyValue);

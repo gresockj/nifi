@@ -40,4 +40,15 @@ public interface ControllerServiceResolver {
      */
     Set<String> resolveInheritedControllerServices(FlowSnapshotContainer flowSnapshotContainer, String parentGroupId, NiFiUser user);
 
+    /**
+     * Computes a detailed plan for live Controller Service resolution separating updates by component kind in order to
+     * avoid ambiguity when applying changes.
+     *
+     * @param flowSnapshotContainer snapshot container supplying external Controller Service name mappings
+     * @param parentGroupId the id of the Process Group root for traversal
+     * @param user invoking user (for authorization filtering)
+     * @return LiveControllerServiceResolutionPlan containing separate maps for Processors and Controller Services
+     */
+    LiveControllerServiceResolutionPlan planLiveControllerServiceResolutions(FlowSnapshotContainer flowSnapshotContainer, String parentGroupId, NiFiUser user);
+
 }

@@ -20,9 +20,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.nifi.authorization.Authorizer;
 import org.apache.nifi.authorization.RequestAction;
 import org.apache.nifi.authorization.user.NiFiUser;
+import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.controller.ControllerService;
+import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.flow.FlowManager;
 import org.apache.nifi.flow.Bundle;
 import org.apache.nifi.flow.ControllerServiceAPI;
+import org.apache.nifi.flow.ExternalControllerServiceReference;
 import org.apache.nifi.flow.VersionedControllerService;
 import org.apache.nifi.flow.VersionedProcessGroup;
 import org.apache.nifi.flow.VersionedProcessor;
@@ -35,6 +39,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Proxy;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -57,6 +62,8 @@ public class StandardControllerServiceResolverTest {
     private NiFiRegistryFlowMapper flowMapper;
     private ControllerServiceProvider controllerServiceProvider;
     private ControllerServiceApiLookup controllerServiceApiLookup;
+    private Authorizer authorizer;
+    private FlowManager flowManager;
 
     private NiFiUser nifiUser;
     private ProcessGroup parentGroup;
@@ -67,8 +74,8 @@ public class StandardControllerServiceResolverTest {
 
     @BeforeEach
     public void setup() {
-        Authorizer authorizer = mock(Authorizer.class);
-        FlowManager flowManager = mock(FlowManager.class);
+        authorizer = mock(Authorizer.class);
+        flowManager = mock(FlowManager.class);
         flowMapper = mock(NiFiRegistryFlowMapper.class);
         controllerServiceProvider = mock(ControllerServiceProvider.class);
         controllerServiceApiLookup = mock(ControllerServiceApiLookup.class);
@@ -136,6 +143,152 @@ public class StandardControllerServiceResolverTest {
 
         final String resolvedConvertRecordWriterId = childConvertRecord.getProperties().get("record-writer");
         assertEquals(parentWriter.getIdentifier(), resolvedConvertRecordWriterId);
+    }
+
+    // ------------------------------------------------------------
+    // Live resolution tests (post-sync): findLiveControllerServiceResolutions
+    // These tests complement the existing snapshot-based tests above and
+    // validate nearest-ancestor matching, authorization filtering, and
+    // ambiguity handling for the live resolver.
+    // ------------------------------------------------------------
+    @Test
+    public void testFindLiveResolutionsResolvesProcessorToNearestAncestorService() {
+        // Arrange live group hierarchy: parent -> child
+        final ProcessGroup parent = mock(ProcessGroup.class);
+        when(parent.getIdentifier()).thenReturn("parent");
+        when(parent.getParent()).thenReturn(null);
+        when(parent.getProcessGroups()).thenReturn(Collections.emptySet());
+        when(parent.getProcessors()).thenReturn(Collections.emptySet());
+
+        final ProcessGroup child = mock(ProcessGroup.class);
+        when(child.getIdentifier()).thenReturn("child");
+        when(child.getParent()).thenReturn(parent);
+        when(child.getProcessGroups()).thenReturn(Collections.emptySet());
+        when(flowManager.getGroup("child")).thenReturn(child);
+
+        // Authorized ancestor Controller Service with matching name & API
+        final ControllerServiceNode ancestorSvc = mock(ControllerServiceNode.class);
+        when(ancestorSvc.getName()).thenReturn("SSL Context Service");
+        when(ancestorSvc.isAuthorized(any(Authorizer.class), any(RequestAction.class), any(NiFiUser.class))).thenReturn(true);
+        when(ancestorSvc.getIdentifier()).thenReturn("svc-parent-1");
+        final Object proxy = Proxy.newProxyInstance(getClass().getClassLoader(), new Class[]{ControllerService.class}, (p, m, a) -> null);
+        when(ancestorSvc.getControllerServiceImplementation()).thenReturn((ControllerService) proxy);
+        when(parent.getControllerServices(false)).thenReturn(Collections.singleton(ancestorSvc));
+
+        // Child processor with CS-identifying property set to external UUID
+        final String externalId = "ext-uuid";
+        final ProcessorNode processor = mock(ProcessorNode.class);
+        final PropertyDescriptor csDescriptor = new PropertyDescriptor.Builder()
+                .name("SSL Context Service")
+                .identifiesControllerService(ControllerService.class)
+                .build();
+        when(processor.getPropertyDescriptors()).thenReturn(Collections.singletonList(csDescriptor));
+        when(processor.getPropertyDescriptor("SSL Context Service")).thenReturn(csDescriptor);
+        when(processor.getRawPropertyValue(csDescriptor)).thenReturn(externalId);
+        when(processor.getIdentifier()).thenReturn("proc-1");
+        when(child.getProcessors()).thenReturn(Collections.singleton(processor));
+        when(child.getControllerServices(false)).thenReturn(Collections.emptySet());
+
+        // Snapshot mapping externalId -> name
+        final RegisteredFlowSnapshot top = mock(RegisteredFlowSnapshot.class);
+        when(top.getExternalControllerServices()).thenReturn(Map.of(externalId, externalRef("SSL Context Service")));
+        final FlowSnapshotContainer container = new FlowSnapshotContainer(top);
+
+        // Act
+        final LiveControllerServiceResolutionPlan plan = ((StandardControllerServiceResolver) serviceResolver)
+                .planLiveControllerServiceResolutions(container, "child", nifiUser);
+
+        // Assert (processor updates)
+        assertNotNull(plan.getProcessorUpdates().get("proc-1"));
+        assertEquals(ancestorSvc.getIdentifier(), plan.getProcessorUpdates().get("proc-1").get("SSL Context Service"));
+    }
+
+    @Test
+    public void testFindLiveResolutionsSkipsWhenAncestorNotAuthorized() {
+        final ProcessGroup parent = mock(ProcessGroup.class);
+        final ProcessGroup child = mock(ProcessGroup.class);
+        when(child.getParent()).thenReturn(parent);
+        when(flowManager.getGroup("child")).thenReturn(child);
+
+        final ControllerServiceNode ancestorSvc = mock(ControllerServiceNode.class);
+        when(ancestorSvc.getName()).thenReturn("SSL Context Service");
+        when(ancestorSvc.isAuthorized(any(Authorizer.class), any(RequestAction.class), any(NiFiUser.class))).thenReturn(false);
+        when(parent.getControllerServices(false)).thenReturn(Collections.singleton(ancestorSvc));
+
+        final String externalId = "ext-uuid";
+        final ProcessorNode processor = mock(ProcessorNode.class);
+        final PropertyDescriptor csDescriptor = new PropertyDescriptor.Builder()
+                .name("SSL Context Service")
+                .identifiesControllerService(ControllerService.class)
+                .build();
+        when(processor.getPropertyDescriptors()).thenReturn(Collections.singletonList(csDescriptor));
+        when(processor.getPropertyDescriptor("SSL Context Service")).thenReturn(csDescriptor);
+        when(processor.getRawPropertyValue(csDescriptor)).thenReturn(externalId);
+        when(processor.getIdentifier()).thenReturn("proc-1");
+        when(child.getProcessors()).thenReturn(Collections.singleton(processor));
+        when(child.getControllerServices(false)).thenReturn(Collections.emptySet());
+
+        final RegisteredFlowSnapshot top = mock(RegisteredFlowSnapshot.class);
+        when(top.getExternalControllerServices()).thenReturn(Map.of(externalId, externalRef("SSL Context Service")));
+        final FlowSnapshotContainer container = new FlowSnapshotContainer(top);
+
+        final LiveControllerServiceResolutionPlan plan = ((StandardControllerServiceResolver) serviceResolver)
+                .planLiveControllerServiceResolutions(container, "child", nifiUser);
+        // No updates when ancestor candidate is not authorized
+        assertEquals(Collections.emptyMap(), plan.getProcessorUpdates());
+        assertEquals(Collections.emptyMap(), plan.getControllerServiceUpdates());
+    }
+
+    @Test
+    public void testFindLiveResolutionsSkipsAmbiguousSameLevelMatches() {
+        final ProcessGroup parent = mock(ProcessGroup.class);
+        final ProcessGroup child = mock(ProcessGroup.class);
+        when(child.getParent()).thenReturn(parent);
+        when(flowManager.getGroup("child")).thenReturn(child);
+
+        final ControllerServiceNode svc1 = mock(ControllerServiceNode.class);
+        when(svc1.getName()).thenReturn("SSL Context Service");
+        when(svc1.isAuthorized(any(Authorizer.class), any(RequestAction.class), any(NiFiUser.class))).thenReturn(true);
+        when(svc1.getIdentifier()).thenReturn("svc-parent-1");
+        when(svc1.getControllerServiceImplementation()).thenReturn((ControllerService) Proxy.newProxyInstance(getClass().getClassLoader(), new Class[]{ControllerService.class}, (p, m, a) -> null));
+
+        final ControllerServiceNode svc2 = mock(ControllerServiceNode.class);
+        when(svc2.getName()).thenReturn("SSL Context Service");
+        when(svc2.isAuthorized(any(Authorizer.class), any(RequestAction.class), any(NiFiUser.class))).thenReturn(true);
+        when(svc2.getIdentifier()).thenReturn("svc-parent-2");
+        when(svc2.getControllerServiceImplementation()).thenReturn((ControllerService) Proxy.newProxyInstance(getClass().getClassLoader(), new Class[]{ControllerService.class}, (p, m, a) -> null));
+
+        when(parent.getControllerServices(false)).thenReturn(new HashSet<>(Arrays.asList(svc1, svc2)));
+
+        final String externalId = "ext-uuid";
+        final ProcessorNode processor = mock(ProcessorNode.class);
+        final PropertyDescriptor csDescriptor = new PropertyDescriptor.Builder()
+                .name("SSL Context Service")
+                .identifiesControllerService(ControllerService.class)
+                .build();
+        when(processor.getPropertyDescriptors()).thenReturn(Collections.singletonList(csDescriptor));
+        when(processor.getPropertyDescriptor("SSL Context Service")).thenReturn(csDescriptor);
+        when(processor.getRawPropertyValue(csDescriptor)).thenReturn(externalId);
+        when(processor.getIdentifier()).thenReturn("proc-1");
+        when(child.getProcessors()).thenReturn(Collections.singleton(processor));
+        when(child.getControllerServices(false)).thenReturn(Collections.emptySet());
+
+        final RegisteredFlowSnapshot top = mock(RegisteredFlowSnapshot.class);
+        when(top.getExternalControllerServices()).thenReturn(Map.of(externalId, externalRef("SSL Context Service")));
+        final FlowSnapshotContainer container = new FlowSnapshotContainer(top);
+
+        final LiveControllerServiceResolutionPlan plan = ((StandardControllerServiceResolver) serviceResolver)
+                .planLiveControllerServiceResolutions(container, "child", nifiUser);
+        // No updates when ambiguous same-level matches
+        assertEquals(Collections.emptyMap(), plan.getProcessorUpdates());
+        assertEquals(Collections.emptyMap(), plan.getControllerServiceUpdates());
+    }
+
+    private static ExternalControllerServiceReference externalRef(final String name) {
+        final ExternalControllerServiceReference ref = new ExternalControllerServiceReference();
+        ref.setIdentifier("ignored");
+        ref.setName(name);
+        return ref;
     }
 
     @Test
