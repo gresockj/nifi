@@ -121,10 +121,10 @@ public class StandardControllerServiceResolver implements ControllerServiceResol
 
         final Map<String, Map<String, String>> processorUpdates = new HashMap<>();
         final Map<String, Map<String, String>> controllerServiceUpdates = new HashMap<>();
+        final Set<String> unresolvedIdentifiers = new HashSet<>();
 
-        findLiveResolutionsPlanRecursive(root, ancestorStack, externalIdToName, user, processorUpdates, controllerServiceUpdates);
-        // TODO: Pass the computed set of unresolved identifiers
-        return new LiveControllerServiceResolutionPlan(processorUpdates, controllerServiceUpdates, Set.of());
+        findLiveResolutionsPlanRecursive(root, ancestorStack, externalIdToName, user, processorUpdates, controllerServiceUpdates, unresolvedIdentifiers);
+        return new LiveControllerServiceResolutionPlan(processorUpdates, controllerServiceUpdates, unresolvedIdentifiers);
     }
 
     private void findLiveResolutionsPlanRecursive(final ProcessGroup group,
@@ -132,17 +132,18 @@ public class StandardControllerServiceResolver implements ControllerServiceResol
                                                   final Map<String, String> externalIdToName,
                                                   final NiFiUser user,
                                                   final Map<String, Map<String, String>> processorUpdates,
-                                                  final Map<String, Map<String, String>> controllerServiceUpdates) {
+                                                  final Map<String, Map<String, String>> controllerServiceUpdates,
+                                                  final Set<String> unresolvedIdentifiers) {
         // Resolve current group components using only ancestors
         for (final ProcessorNode processorNode : group.getProcessors()) {
-            final Map<String, String> updates = findServiceReferenceUpdatesLevelAware(processorNode, ancestorStack, externalIdToName);
+            final Map<String, String> updates = findServiceReferenceUpdatesLevelAware(processorNode, ancestorStack, externalIdToName, unresolvedIdentifiers);
             if (!updates.isEmpty()) {
                 processorUpdates.put(processorNode.getIdentifier(), updates);
             }
         }
 
         for (final ControllerServiceNode serviceNode : group.getControllerServices(false)) {
-            final Map<String, String> updates = findServiceReferenceUpdatesLevelAware(serviceNode, ancestorStack, externalIdToName);
+            final Map<String, String> updates = findServiceReferenceUpdatesLevelAware(serviceNode, ancestorStack, externalIdToName, unresolvedIdentifiers);
             if (!updates.isEmpty()) {
                 controllerServiceUpdates.put(serviceNode.getIdentifier(), updates);
             }
@@ -155,7 +156,7 @@ public class StandardControllerServiceResolver implements ControllerServiceResol
         ancestorStack.push(currentServices);
 
         for (final ProcessGroup child : group.getProcessGroups()) {
-            findLiveResolutionsPlanRecursive(child, ancestorStack, externalIdToName, user, processorUpdates, controllerServiceUpdates);
+            findLiveResolutionsPlanRecursive(child, ancestorStack, externalIdToName, user, processorUpdates, controllerServiceUpdates, unresolvedIdentifiers);
         }
 
         ancestorStack.pop();
@@ -163,7 +164,8 @@ public class StandardControllerServiceResolver implements ControllerServiceResol
 
     private Map<String, String> findServiceReferenceUpdatesLevelAware(final ComponentNode componentNode,
                                                                       final Deque<Set<ControllerServiceNode>> ancestorStack,
-                                                                      final Map<String, String> externalIdToName) {
+                                                                      final Map<String, String> externalIdToName,
+                                                                      final Set<String> unresolvedIdentifiers) {
         final Map<String, String> updates = new HashMap<>();
 
         componentNode.getPropertyDescriptors().forEach(listedDescriptor -> {
@@ -178,47 +180,48 @@ public class StandardControllerServiceResolver implements ControllerServiceResol
             }
 
             final String rawValue = componentNode.getRawPropertyValue(descriptor);
-            if (rawValue == null || isParameterized(rawValue)) {
+            if (rawValue == null) {
                 return;
             }
 
-            // If already points to an existing service in scope, skip
-            final boolean exists = ancestorStack.stream().flatMap(Set::stream).anyMatch(svc -> svc.getIdentifier().equals(rawValue));
-            if (exists) {
+            // Flatten all ancestor services to check availability across all levels
+            final List<ControllerServiceNode> availableControllerServices = ancestorStack.stream()
+                    .flatMap(Set::stream)
+                    .collect(Collectors.toList());
+
+            final Set<String> availableControllerServiceIds = availableControllerServices.stream()
+                    .map(ControllerServiceNode::getIdentifier)
+                    .collect(Collectors.toSet());
+
+            // If the referenced Controller Service is available, there is nothing to resolve.
+            if (availableControllerServiceIds.contains(rawValue)) {
                 return;
             }
 
             final String externalName = externalIdToName.get(rawValue);
             if (externalName == null) {
+                unresolvedIdentifiers.add(rawValue);
                 return;
             }
 
-            ControllerServiceNode chosen = null;
-            for (final Set<ControllerServiceNode> levelServices : ancestorStack) {
-                final List<ControllerServiceNode> levelMatches = levelServices.stream()
-                        .filter(svc -> externalName.equals(svc.getName()))
-                        .filter(svc -> requiredApi.isAssignableFrom(svc.getControllerServiceImplementation().getClass()))
-                        .toList();
+            // Search across ALL ancestor levels for matches (not level-by-level)
+            final List<ControllerServiceNode> matchingControllerServices = availableControllerServices.stream()
+                    .filter(svc -> externalName.equals(svc.getName()))
+                    .filter(svc -> requiredApi.isAssignableFrom(svc.getControllerServiceImplementation().getClass()))
+                    .toList();
 
-                if (levelMatches.size() == 1) {
-                    chosen = levelMatches.getFirst();
-                    break;
-                } else if (levelMatches.size() > 1) {
-                    // Ambiguous at this level; stop evaluation
-                    break;
-                }
+            // Require exactly 1 match across all levels - 0 or multiple matches means unresolved
+            if (matchingControllerServices.size() != 1) {
+                unresolvedIdentifiers.add(rawValue);
+                return;
             }
 
-            if (chosen != null) {
-                updates.put(descriptor.getName(), chosen.getIdentifier());
-            }
+            final ControllerServiceNode matchingService = matchingControllerServices.get(0);
+            final String resolvedId = matchingService.getIdentifier();
+            updates.put(descriptor.getName(), resolvedId);
         });
 
         return updates;
-    }
-
-    private boolean isParameterized(final String value) {
-        return value.contains("#{") || value.contains("${");
     }
 
     private void buildExternalControllerServiceNameMap(final FlowSnapshotContainer container, final Map<String, String> idToName) {
@@ -341,7 +344,6 @@ public class StandardControllerServiceResolver implements ControllerServiceResol
 
             // If the referenced Controller Service is available, there is nothing to resolve.
             if (availableControllerServiceIds.contains(propertyValue)) {
-                unresolvedServices.add(propertyValue);
                 continue;
             }
 
@@ -353,7 +355,6 @@ public class StandardControllerServiceResolver implements ControllerServiceResol
 
             final ControllerServiceAPI descriptorRequiredApi = componentRequiredApis.get(propertyName);
             if (descriptorRequiredApi == null) {
-                unresolvedServices.add(propertyValue);
                 continue;
             }
 
